@@ -1,0 +1,17 @@
+@import "tailwindcss";
+@import "../root.css";
+
+@source "../../node_modules/@blocknote/shadcn";
+
+.bn-container[data-color-scheme] {
+    --bn-colors-editor-background: transparent;
+    --bn-font-family: "PT Sans", "sans-serif";
+}
+
+.bn-container {
+    @apply h-full overflow-y-scroll ;
+}
+
+.bn-editor {
+    @apply  h-full px-8 text-base overflow-y-scroll;
+}
