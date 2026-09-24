@@ -16,7 +16,11 @@ use event::event_manager::EVENT_MANAGER;
 use notes::{Document, Note, NoteManager};
 use storage::Storage;
 
-use tauri::Manager;
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::TrayIconBuilder,
+    Manager,
+};
 
 use log::LevelFilter;
 
@@ -27,7 +31,7 @@ use hyprland::shared::HyprDataActive;
 fn add_hypr_position_rule() {
     let monitor = Monitor::get_active().unwrap();
 
-    let (w, h) = (300, 600);
+    let (w, h) = (600, 900);
 
     let (m_w, m_h) = (monitor.width, monitor.height);
 
@@ -147,6 +151,16 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+// Check if the second instance was launched with the "--show" flag
+            let should_show = argv.iter().any(|arg| arg == "--show");
+            if should_show {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.show().unwrap();
+                    window.set_focus().unwrap();
+                }
+            }
+        }))
         .invoke_handler(tauri::generate_handler![
             greet,
             get_advertisement,
@@ -156,8 +170,36 @@ pub fn run() {
             get_note
         ])
         .setup(|app| {
+            // Set up system trait
+            let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let show_i = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            window.show().unwrap();
+                            window.set_focus().unwrap();
+                        }
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
             app.manage(Mutex::new(NoteManager::new()));
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                window.hide().unwrap();
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

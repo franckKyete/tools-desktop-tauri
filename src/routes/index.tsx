@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import img from "../assets/icons/work-in-progress.gif";
+import img from "../assets/icon-foreground.png";
 import { Button } from "@/components/ui/button";
 import { Link } from "@tanstack/react-router";
 
@@ -13,7 +13,7 @@ function RouteComponent() {
             <p className="font-pt-sans-caption text-center text-2xl font-bold text-white">
                 Effortlessly organize stuff and connect your devices
             </p>
-            <img src={img} className="aspect-square w-40 rounded-2xl" />
+            <img src={img} className="aspect-square bg-transparent w-40 rounded-2xl" />
             <Link to="/setup">
                 <Button variant="outline" className="rounded-full bg-transparent">
                     Get started
