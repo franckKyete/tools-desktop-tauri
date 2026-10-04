@@ -7,18 +7,25 @@ pub enum DataType {
     ReconnectionAck = 0x04,
     Disconnection = 0x05,
     Packet = 0x06,
+    FileChunk = 0x07,
+    AutomergeSync = 0x08,
+    ChunkAck = 0x09,
     Unknown,
 }
 
 impl From<u8> for DataType {
     fn from(value: u8) -> Self {
         match value {
+            0x00 => Self::Handshake,
             0x01 => Self::Handshake,
             0x02 => Self::Reconnection,
             0x03 => Self::HandshakeAck,
             0x04 => Self::ReconnectionAck,
             0x05 => Self::Disconnection,
             0x06 => Self::Packet,
+            0x07 => Self::FileChunk,
+            0x08 => Self::AutomergeSync,
+            0x09 => Self::ChunkAck,
             _ => Self::Unknown,
         }
     }
@@ -76,3 +83,36 @@ pub struct ReconnectionAck {
     pub token: [u8; 10],
 }
 impl Layout for ReconnectionAck {}
+
+pub const CHUNK_FLAG_EOF: u8 = 0x01;
+pub const CHUNK_FLAG_ACK_REQ: u8 = 0x02;
+pub const CHUNK_FLAG_RESUMED: u8 = 0x04;
+
+pub const CHUNK_STATUS_OK: u8 = 0x00;
+pub const CHUNK_STATUS_CRC_FAIL: u8 = 0x01;
+pub const CHUNK_STATUS_IO_ERROR: u8 = 0x02;
+
+#[derive(Copy, Clone, Pod, Zeroable, Debug, PartialEq, Eq)]
+#[repr(C, packed)]
+pub struct FileChunkHeader {
+    pub transfer_id: [u8; 16],
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+    pub byte_offset: u64,
+    pub payload_len: u32,
+    pub flags: u8,
+    pub checksum: u32,
+}
+impl Layout for FileChunkHeader {}
+
+#[derive(Copy, Clone, Pod, Zeroable, Debug, PartialEq, Eq)]
+#[repr(C, packed)]
+pub struct ChunkAckHeader {
+    pub transfer_id: [u8; 16],
+    pub cumulative_chunk_index: u32,
+    pub window_credit: u32,
+    pub status: u8,
+    pub nack_chunk_index: u32,
+}
+impl Layout for ChunkAckHeader {}
+

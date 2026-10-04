@@ -1,6 +1,6 @@
 # Tools Bridge Protocol Specification
 
-The **Tools Bridge Protocol** is a lightweight, local-first framing and messaging protocol enabling bi-directional communication between desktop workstations and mobile clients over heterogeneous transports (Bluetooth RFCOMM and WebSocket).
+The **Tools Bridge Protocol** is a lightweight, local-first framing and messaging protocol enabling bi-directional communication between desktop workstations and mobile companions over heterogeneous transports (Bluetooth RFCOMM and WebSockets).
 
 ---
 
@@ -17,210 +17,129 @@ sequenceDiagram
     Desktop->>Mobile: Display QR Code (User Scans)
     
     Mobile->>Desktop: Connect (Transport: BT RFCOMM or WS)
-    Mobile->>Desktop: Frame: Handshake (Device info, capabilities)
-    Desktop->>Mobile: Frame: HandshakeAck (accepted=0x01, token=10 bytes)
-    Note over Desktop,Mobile: Bridge Established (Ready for Packets)
+    Mobile->>Desktop: Frame: Handshake [0x01] (Device info, capabilities)
+    Desktop->>Mobile: Frame: HandshakeAck [0x03] (accepted=0x01, token=10 bytes)
+    Note over Desktop,Mobile: Bridge Established (Ready for Packets & Streams)
 
     rect rgb(20, 30, 45)
-    Note over Desktop,Mobile: Data Exchange
-    Mobile->>Desktop: Frame: Packet (JSON Payload: Clipboard, Note, File, etc.)
-    Desktop->>Mobile: Frame: Packet (JSON Payload: Ping, Pong, Text, etc.)
+    Note over Desktop,Mobile: Control Plane (DataType::Packet 0x06)
+    Mobile->>Desktop: Frame: Packet (JSON: Clipboard, FileRequest, etc.)
+    Desktop->>Mobile: Frame: Packet (JSON: FileResponse, Text, Ping, etc.)
+    end
+
+    rect rgb(25, 40, 30)
+    Note over Desktop,Mobile: CRDT Sync Plane (DataType::AutomergeSync 0x08)
+    Mobile->>Desktop: AutomergeSync Frame [0x08][u16 len][id][binary msg]
+    Desktop->>Mobile: AutomergeSync Frame (Deltas & Sibling Relays)
+    end
+
+    rect rgb(40, 25, 30)
+    Note over Desktop,Mobile: Data Plane (DataType::FileChunk 0x07 & ChunkAck 0x09)
+    Desktop->>Mobile: FileChunk [0x07] (41B Header + Raw File Bytes)
+    Mobile->>Desktop: ChunkAck [0x09] (28B Window Credit Feedback)
     end
 
     Note over Desktop,Mobile: Network Interruption / Reconnection
     Mobile->>Desktop: Reconnect
-    Mobile->>Desktop: Frame: Reconnection (token=10 bytes)
-    Desktop->>Mobile: Frame: ReconnectionAck (accepted=0x01, new_token=10 bytes)
-    Desktop->>Mobile: Resend Pending Unsent Packets
+    Mobile->>Desktop: Frame: Reconnection [0x02] (token=10 bytes)
+    Desktop->>Mobile: Frame: ReconnectionAck [0x04] (accepted=0x01, new_token=10 bytes)
+    Desktop->>Mobile: Active-First Sync & Pending Message Replay
 ```
 
 ---
 
 ## 1. Discovery and Advertisement
 
-The desktop initiates pairing by rendering a high-density QR code containing an [`Advertisement`](file:///home/kyete/kitchen/tools-ws/workspaces/main/tools-desktop-tauri/src-tauri/src/bridge/packets.rs#L54-L59) JSON payload:
+The desktop initiates pairing by rendering a QR code containing an `Advertisement` JSON payload:
 
 ```json
 {
   "device": {
     "name": "kyete-desktop",
+    "alias": "Studio PC",
     "device_type": "desktop"
   },
-  "capabilities": ["text", "websocket", "bluetooth"],
+  "capabilities": ["text", "websocket", "bluetooth", "notes_crdt", "file_streaming"],
   "connection_details": {
     "bluetooth_address": "XX:XX:XX:XX:XX:XX",
     "websocket_url": "ws://192.168.1.150:8080"
   },
-  "protocol_version": "1.0"
-}
-```
-
-### Discovery Fields
-| Field | Type | Description |
-|---|---|---|
-| `device.name` | `string` | Human-readable hostname of the machine. |
-| `device.device_type` | `string` | Device category (`"desktop"`, `"phone"`). |
-| `capabilities` | `string[]` | List of supported features and transports. |
-| `connection_details.bluetooth_address` | `string \| null` | BlueZ adapter MAC address for RFCOMM pairing. |
-| `connection_details.websocket_url` | `string \| null` | Local LAN WebSocket URI for low-latency streaming. |
-| `protocol_version` | `string` | Version of the wire protocol (currently `"1.0"`). |
-
----
-
-## 2. Binary Framing & DataType Headers
-
-All frames transmitted over the transport begin with a **1-byte DataType identifier**:
-
-```
-+-------------------+--------------------------------------------+
-| DataType (1 byte) | Frame Data (variable length)               |
-+-------------------+--------------------------------------------+
-```
-
-### Frame Types ([`DataType`](file:///home/kyete/kitchen/tools-ws/workspaces/main/tools-desktop-tauri/src-tauri/src/bridge/connection/bin_data.rs#L10-L18))
-| Hex Code | Name | Description |
-|---|---|---|
-| `0x00` | `Handshake` | Sent by client to introduce device specifications upon initial connection. |
-| `0x01` | `HandshakeAck` | Sent by desktop acknowledging pairing and delivering a session token. |
-| `0x02` | `Disconnection` | Sent to cleanly terminate a session. |
-| `0x03` | `Reconnection` | Sent by client reconnecting with an existing session token. |
-| `0x04` | `ReconnectionAck`| Sent by desktop confirming session resumption and rotating token. |
-| `0x05` | `Packet` | High-level application message payload (UTF-8 JSON string). |
-
----
-
-## 3. Handshake & Reconnection Wire Layouts
-
-### Handshake Frame (`0x00`)
-```
-Offset  Size  Field              Type / Description
------------------------------------------------------------
-0x00    1     DataType           0x00 (Handshake)
-0x01    1     device_type        0x01 = Phone, 0x02 = PC
-0x02    2     device_name_len    u16 (Big-Endian)
-0x04    N     device_name        UTF-8 string (device_name_len bytes)
-```
-
-### HandshakeAck Frame (`0x01`)
-```
-Offset  Size  Field              Type / Description
------------------------------------------------------------
-0x00    1     DataType           0x01 (HandshakeAck)
-0x01    1     accepted           0x01 = Approved, 0x00 = Rejected
-0x02    10    reconnection_token 10-byte cryptographic session token
-```
-
-### Reconnection Frame (`0x03`)
-```
-Offset  Size  Field              Type / Description
------------------------------------------------------------
-0x00    1     DataType           0x03 (Reconnection)
-0x01    10    token              10-byte session token from previous ACK
-```
-
-### ReconnectionAck Frame (`0x04`)
-```
-Offset  Size  Field              Type / Description
------------------------------------------------------------
-0x00    1     DataType           0x04 (ReconnectionAck)
-0x01    1     accepted           0x01 = Resumed, 0x00 = Invalid/Expired
-0x02    10    token              New 10-byte rotated token (if accepted)
-```
-
----
-
-## 4. Application Packet Schema (`DataType::Packet`)
-
-When `DataType == 0x05`, the remaining bytes represent a UTF-8 JSON [`Packet`](file:///home/kyete/kitchen/tools-ws/workspaces/main/tools-desktop-tauri/src-tauri/src/bridge/packets.rs#L78-L83) structure.
-
-### Packet Envelope
-```json
-{
-  "timestamp": 1727900000,
-  "type": "<PayloadType>",
-  "payload": { ... }
-}
-```
-
-### Supported Payloads
-
-#### 1. Clipboard Sync (`Payload::Clipboard`)
-Synchronizes clipboard plain text or formatted contents between devices.
-```json
-{
-  "type": "Clipboard",
-  "payload": {
-    "content": "Text copied on desktop"
-  }
-}
-```
-
-#### 2. Text Message (`Payload::Text`)
-Direct text payload used for conversational messaging or lightweight updates.
-```json
-{
-  "type": "Text",
-  "payload": {
-    "content": "Hello from mobile!"
-  }
-}
-```
-
-#### 3. Heartbeat (`Payload::Ping` & `Payload::Pong`)
-Connection liveness check.
-```json
-{ "type": "Ping" }
-{ "type": "Pong" }
-```
-
-#### 4. File Transfer Request (`Payload::FileRequest`)
-Initiates a binary file transfer across the link.
-```json
-{
-  "type": "FileRequest",
-  "payload": {
-    "file_name": "photo.jpg",
-    "file_size": 2048500,
-    "mime_type": "image/jpeg",
-    "transfer_mode": "stream",
-    "transfer_id": "tx-8f92b"
-  }
-}
-```
-
-#### 5. File Transfer Response (`Payload::FileResponse`)
-Accepts or denies a pending file transfer.
-```json
-{
-  "type": "FileResponse",
-  "payload": {
-    "transfer_id": "tx-8f92b",
-    "accepted": true,
-    "message": "Ready to receive"
-  }
-}
-```
-
-#### 6. Error Notice (`Payload::Error`)
-Reports protocol-level or payload processing errors.
-```json
-{
-  "type": "Error",
-  "payload": {
-    "code": "invalid-format",
-    "context": "PacketParser",
-    "message": "Unknown data format received"
-  }
+  "protocol_version": "2.0"
 }
 ```
 
 ---
 
-## 5. Message Reliability & Queueing
+## 2. Outer Framing & Canonical DataType Enum
 
-In real-world usage, local Wi-Fi signals drop or mobile devices suspend network interfaces when screens lock.
+All frames transmitted over Bluetooth RFCOMM and raw sockets begin with the Protocol v2 7-byte framing header:
 
-The Tools Bridge implements **pending message persistence**:
-1. All outgoing messages are stored with `sent = false` in a local `SavedPacket` queue.
-2. Upon connection drop, unsent messages remain queued in SQLite.
-3. Once the client issues a successful `Reconnection` with its valid 10-byte token, the desktop triggers `resend_pending_messages()`, replaying all unsent text and clipboard updates in chronological order.
+```
++--------------------+-------------------+-----------------------+
+| Magic (2B, 0x424D) | Version (1B, 0x02)| Length (4B, Little-End)|
++--------------------+-------------------+-----------------------+
+```
+
+Immediately following the outer header, byte `0x00` is the canonical **DataType** byte:
+
+| Hex Code | Name | Plane | Description |
+|---|---|---|---|
+| `0x01` | `Handshake` | Control | Sent by client to introduce device specifications upon initial connection. |
+| `0x02` | `Reconnection` | Control | Sent by client reconnecting with an existing session token. |
+| `0x03` | `HandshakeAck` | Control | Sent by desktop acknowledging pairing and delivering a session token. |
+| `0x04` | `ReconnectionAck`| Control | Sent by desktop confirming session resumption and rotating token. |
+| `0x05` | `Disconnection` | Control | Sent to cleanly terminate a session. |
+| `0x06` | `Packet` | Control | UTF-8 JSON application control envelope (Clipboard, FileRequest, etc.). |
+| `0x07` | `FileChunk` | Data | 41-byte structured binary chunk header + raw binary file slice. |
+| `0x08` | `AutomergeSync` | Sync | Compact binary CRDT synchronization message for rich-text notes. |
+| `0x09` | `ChunkAck` | Data | 28-byte sliding-window flow control feedback frame. |
+
+---
+
+## 3. Specialized Binary Wire Layouts
+
+### 3.1. AutomergeSync Frame (`0x08`)
+```
+Offset  Size (B)  Field            Type / Description
+-----------------------------------------------------------------------------------
+0x00    1         DataType         0x08 (AutomergeSync)
+0x01    2         note_id_len      u16 Big-Endian (length N of note UUID string)
+0x03    N         note_id          UTF-8 note UUID string (N bytes)
+0x03+N  M         sync_message     Raw binary Automerge sync state bytes (M bytes)
+```
+
+### 3.2. FileChunk Frame (`0x07`)
+```
+Offset  Size (B)  Field            Type / Description
+-----------------------------------------------------------------------------------
+0x00    1         DataType         0x07 (FileChunk)
+0x01    16        transfer_id      16-byte raw UUID (128-bit)
+0x11    4         chunk_index      u32 Little-Endian (0-based chunk sequence index)
+0x15    4         total_chunks     u32 Little-Endian (total chunk count for transfer)
+0x19    8         offset           u64 Little-Endian (byte offset within destination)
+0x21    4         payload_length   u32 Little-Endian (byte length K of this chunk)
+0x25    1         flags            u8 bitfield: 0x01=EOF, 0x02=ACK_REQ, 0x04=RESUMED
+0x26    4         checksum         u32 Little-Endian (IEEE CRC-32 of payload_bytes)
+0x2A    K         payload_bytes    Raw binary file content (K bytes)
+```
+
+### 3.3. ChunkAck Frame (`0x09`)
+```
+Offset  Size (B)  Field            Type / Description
+-----------------------------------------------------------------------------------
+0x00    1         DataType         0x09 (ChunkAck)
+0x01    16        transfer_id      16-byte raw UUID (128-bit)
+0x11    4         cumulative_index u32 Little-Endian (highest contiguous chunk received)
+0x15    4         window_credit    u32 Little-Endian (number of chunks sender may send)
+0x19    1         status           0x00=OK, 0x01=CRC_FAIL, 0x02=IO_ERROR
+0x1A    4         nack_chunk_index u32 Little-Endian (failed chunk index if status != 0)
+```
+
+---
+
+## 4. Sliding-Window Flow Control
+
+To prevent buffer overflows on Bluetooth RFCOMM serial links and buffer bloat on WebSockets:
+- **Bluetooth RFCOMM**: Window size $W = 8$ (32 KB to 64 KB in-flight). Chunk size: 4 KB to 8 KB.
+- **WebSocket (LAN)**: Window size $W = 32$ (2 MB in-flight). Chunk size: 64 KB to 128 KB.
+- **Credit Replenishment**: Receiver transmits `ChunkAck` replenishing credit whenever available credit drops to $\le W / 2$.

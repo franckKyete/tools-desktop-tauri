@@ -14,7 +14,7 @@ pub struct ClipboardPayload {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileRequestPayload {
     pub file_name: String,
-    pub file_size: u32,
+    pub file_size: u64,
     pub mime_type: String,
     pub transfer_mode: String,
     pub transfer_id: String,
@@ -64,6 +64,12 @@ pub struct TextPayload {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AutomergeSyncPayload {
+    pub note_id: String,
+    pub message: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "payload")]
 pub enum Payload {
     Ping,
@@ -73,6 +79,7 @@ pub enum Payload {
     FileResponse(FileResponsePayload),
     Error(ErrorPayload),
     Text(TextPayload),
+    AutomergeSync(AutomergeSyncPayload),
 }
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Packet {

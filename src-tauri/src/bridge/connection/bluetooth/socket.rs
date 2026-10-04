@@ -115,23 +115,22 @@ impl connection::interfaces::Writer for Writer {
         buf.extend_from_slice(&header);
         buf.extend_from_slice(data);
 
-        // --- Wait until writable ---
-        writer.writable().await.map_err(SocketError::Io)?;
-
-        // --- Try writing once ---
-        match writer.try_write(&buf) {
-            Ok(0) => {
-                error!("Socket disconnected while writing");
-                Err(SocketError::Disconnected)
+        let mut total = 0;
+        while total < buf.len() {
+            writer.writable().await.map_err(SocketError::Io)?;
+            match writer.try_write(&buf[total..]) {
+                Ok(0) => {
+                    error!("Socket disconnected while writing");
+                    return Err(SocketError::Disconnected);
+                }
+                Ok(n) => {
+                    total += n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(SocketError::Io(e)),
             }
-            Ok(n) if n < buf.len() => {
-                error!("Partial write: wrote {n} of {} bytes", buf.len());
-                Err(SocketError::Other("Incomplete write".to_string()))
-            }
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(SocketError::NotReady),
-            Err(e) => Err(SocketError::Io(e)),
         }
+        Ok(())
     }
 }
 
