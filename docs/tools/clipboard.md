@@ -1,6 +1,6 @@
 # Desktop Clipboard Sync Tool
 
-The **Clipboard Sync Tool** enables bi-directional clipboard synchronization between your PC and mobile devices. Any text copied on your computer is instantly available to paste on your phone, and vice-versa.
+The **Desktop Clipboard Sync Tool** integrates with the system clipboard to provide seamless bi-directional synchronization with mobile companions with automated echo cancellation.
 
 ---
 
@@ -9,66 +9,55 @@ The **Clipboard Sync Tool** enables bi-directional clipboard synchronization bet
 ```mermaid
 sequenceDiagram
     autonumber
-    participant OS as Desktop OS (X11 / Wayland)
-    participant CD as Clipboard Daemon (arboard)
-    participant EM as Event Manager (EVENT_MANAGER)
-    participant BM as Bridge Manager
-    participant Bridge as Bridge Socket
-    participant Mobile as Mobile Device
+    participant LocalClip as System Clipboard (OS)
+    participant Monitor as Desktop Clipboard Monitor
+    participant Filter as Echo Filter (Dual Ring Buffers)
+    participant Bridge as Bridge Transport
+    participant Mobile as Mobile Companion
 
-    loop Every 200ms
-        CD->>OS: Poll clipboard text
-    end
+    Note over LocalClip,Monitor: User copies text on Desktop
+    LocalClip->>Monitor: Clipboard Changed Event / Poll
+    Monitor->>Filter: Check SHA-256(content) in recent_applied_hashes
+    Note over Filter: Hash not found -> Local edit!
+    Filter->>Filter: Push SHA-256 to recent_sent_hashes
+    Monitor->>Bridge: Send Packet(ClipboardPayload: origin_device_id, clip_id, content)
+    Bridge->>Mobile: Transmit Packet
 
-    Note over OS: User copies text: "https://github.com/..."
-    CD->>CD: Detect diff: current != last_content
-    CD->>EM: emit(ClipboardEvent { text })
-    EM->>BM: Trigger subscriber callback
-    BM->>Bridge: bridge.send(Packet::new(Payload::Clipboard(...)))
-    Bridge->>Mobile: Send Frame (DataType::Packet + JSON)
-    Note over Mobile: Phone clipboard updated automatically!
+    Note over Mobile,Bridge: Remote copy arrives from Mobile
+    Mobile->>Bridge: Receive Packet(ClipboardPayload)
+    Bridge->>Filter: Push SHA-256 to recent_applied_hashes
+    Bridge->>LocalClip: arboard::Clipboard.set_text(content)
+    Note over LocalClip,Monitor: OS clipboard triggers monitor
+    Monitor->>Filter: Check SHA-256 in recent_applied_hashes
+    Note over Filter: Hash matches! Echo loop cancelled.
 ```
 
 ---
 
-## Implementation Details
+## 1. Echo Cancellation & Provenance Tracking
 
-### 1. Polling & Diff Detection ([`clipboard/mod.rs`](file:///home/kyete/kitchen/tools-ws/workspaces/main/tools-desktop-tauri/src-tauri/src/clipboard/mod.rs))
-The desktop clipboard engine runs in an isolated `tokio` green thread:
-- Employs the [`arboard`](https://crates.io/crates/arboard) crate for cross-platform access across Linux (Wayland & X11), Windows, and macOS.
-- Polls at a calibrated **200ms interval**, striking an optimal balance between responsiveness and negligible CPU utilization.
-- Stores `last_content: String` in memory to guarantee that duplicate events are never emitted.
+To prevent infinite ping-pong feedback loops when synchronizing clipboards across companions:
 
-### 2. Event Propagation ([`bridge_manager.rs`](file:///home/kyete/kitchen/tools-ws/workspaces/main/tools-desktop-tauri/src-tauri/src/bridge/bridge_manager.rs#L110-L125))
-When a new device connects, `BridgeManager` attaches a listener to `EVENT_MANAGER`:
+### Dual Circular Hash Ring Buffers
+`ClipboardEchoFilter` maintains two fixed-capacity circular buffers (capacity = 20):
+1. **`recent_applied_hashes`**: Stores SHA-256 hashes of text received from remote peers and written to the local clipboard.
+2. **`recent_sent_hashes`**: Stores SHA-256 hashes of local copies broadcast to peers.
+
+### Broadcast Suppression
+When the local system clipboard monitor detects changed text:
+- Computes `hash = sha256(text)`.
+- If `hash` exists in `recent_applied_hashes`, it was written by a remote peer; the event is dropped silently.
+- Otherwise, `hash` is pushed to `recent_sent_hashes` and broadcast to connected peers.
+- Single packet cap: payload text larger than 64 KB is dropped to avoid saturating Bluetooth serial links.
+
+---
+
+## 2. Wire Schema (`ClipboardPayload`)
 
 ```rust
-event_manager.on({
-    let bridge = bridge.clone();
-    move |event: ClipboardEvent| {
-        let bridge = bridge.clone();
-        async move {
-            let packet = Packet::new(Payload::Clipboard(ClipboardPayload {
-                content: event.text,
-            }));
-            bridge.lock().await.send(packet).await;
-        }
-    }
-}).await;
+pub struct ClipboardPayload {
+    pub content: String,
+    pub origin_device_id: String,
+    pub clip_id: String,
+}
 ```
-
-### 3. Incoming Mobile Clipboard Packets
-When the desktop receives a `Payload::Clipboard` packet from a connected mobile device:
-1. The packet is recorded in `Bridge.packets`.
-2. The payload text is written directly into the desktop system clipboard using `arboard`.
-3. The clipboard daemon's `last_content` is synchronized to prevent echo loops back to the phone.
-
----
-
-## Security & Privacy Considerations
-
-- **Local Network Only**: Clipboard data is never routed through external servers or third-party cloud brokers.
-- **Ephemerality**: Clipboard packets are transmitted in real time and can be excluded from persistent disk storage.
-- **Future Controls**:
-  - Whitelist/Blacklist for password managers (ignoring passwords copied from 1Password, Bitwarden, Keepass).
-  - Configurable toggle to pause clipboard synchronization.

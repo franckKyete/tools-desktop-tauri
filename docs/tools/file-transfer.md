@@ -1,69 +1,66 @@
 # Desktop File Transfer Tool
 
-The **File Transfer Tool** enables direct peer-to-peer file sharing between your PC and mobile devices without file size limitations, bandwidth caps, or third-party cloud uploads.
+The **Desktop File Transfer Tool** provides high-throughput, memory-safe binary file exchanges with mobile companions over Bluetooth RFCOMM and LAN WebSockets without relying on third-party cloud services.
 
 ---
 
-## Protocol Workflow
+## Architecture
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Sender as Sender (Mobile or PC)
-    participant Receiver as Receiver (PC or Mobile)
+    participant UI as Desktop React UI
+    participant Bridge as Bridge Transport
+    participant Daemon as File Transfer Daemon
+    participant Disk as Local Disk (~/Downloads)
+    participant Peer as Mobile Companion
 
-    Sender->>Receiver: Payload::FileRequest (Metadata, transfer_id, size)
-    Note over Receiver: Display Transfer Prompt / Dialog
-    alt Transfer Accepted
-        Receiver->>Sender: Payload::FileResponse (accepted=true)
-        loop Binary Chunks
-            Sender->>Receiver: Binary File Chunks (Stream / Frame)
-            Receiver->>Receiver: Write chunks to disk / temp file
+    Note over UI,Peer: Phase 1: Control Plane (DataType::Packet 0x06)
+    UI->>Bridge: Send FileRequest (transfer_id, file_name, file_size, mime_type)
+    Bridge->>Peer: DataType::Packet (FileRequestPayload)
+    Peer-->>Bridge: DataType::Packet (FileResponsePayload: accepted=true)
+    Bridge-->>UI: Transfer Approved
+
+    Note over UI,Peer: Phase 2: Data Plane (DataType::FileChunk 0x07 & ChunkAck 0x09)
+    loop Sliding-Window Streaming (W=8 RFCOMM / W=32 WS)
+        Bridge->>Peer: DataType::FileChunk [0x07] (41B Header + Binary Chunk)
+        Peer-->>Bridge: DataType::ChunkAck [0x09] (28B Window Credit Feedback)
+        opt Throttled (Max 100ms)
+            Bridge->>UI: emit("file_transfer_progress", {transferId, bytes, percent, speed})
         end
-        Note over Receiver: Verify file size & SHA256 checksum
-        Receiver->>Receiver: Move to Downloads folder
-    else Transfer Rejected
-        Receiver->>Sender: Payload::FileResponse (accepted=false, message="User declined")
     end
+
+    Note over UI,Disk: Phase 3: Finalization & Promotion
+    Bridge->>Disk: Verify CRC-32 & File Size
+    Bridge->>Disk: Atomically rename .part -> ~/Downloads/{file_name}
+    Bridge->>UI: emit("file_transfer_complete", {transferId, filePath})
 ```
 
 ---
 
-## Packet Specifications
+## 1. Split-Plane Architecture
 
-Defined in [`packets.rs`](file:///home/kyete/kitchen/tools-ws/workspaces/main/tools-desktop-tauri/src-tauri/src/bridge/packets.rs#L14-L29):
-
-### 1. File Request ([`FileRequestPayload`](file:///home/kyete/kitchen/tools-ws/workspaces/main/tools-desktop-tauri/src-tauri/src/bridge/packets.rs#L14-L21))
-Sent by the transferring device to request permission and prepare the receiver:
-```rust
-pub struct FileRequestPayload {
-    pub file_name: String,      // e.g. "recording.mp4"
-    pub file_size: u32,         // Total size in bytes
-    pub mime_type: String,      // e.g. "video/mp4"
-    pub transfer_mode: String,  // "stream" or "chunked"
-    pub transfer_id: String,    // Unique UUID for the transfer
-}
-```
-
-### 2. File Response ([`FileResponsePayload`](file:///home/kyete/kitchen/tools-ws/workspaces/main/tools-desktop-tauri/src-tauri/src/bridge/packets.rs#L23-L28))
-Sent in reply by the receiving device:
-```rust
-pub struct FileResponsePayload {
-    pub transfer_id: String,    // Corresponds to the FileRequest ID
-    pub accepted: bool,         // true if approved, false if declined
-    pub message: String,        // Status notes or decline reason
-}
-```
+1. **Control Plane (`DataType::Packet` [0x06])**:
+   - Manages request/response negotiation (`FileRequestPayload` and `FileResponsePayload`), authentication verification, and user dialogs.
+   - Bonded companions auto-accept transfers; untrusted peers prompt confirmation.
+2. **Data Plane (`DataType::FileChunk` [0x07] & `ChunkAck` [0x09])**:
+   - Operates directly on native socket threads (`socket.rs`).
+   - Bypasses Tauri frontend IPC serialization, maintaining constant $O(1)$ memory usage (< 1.2 MB).
 
 ---
 
-## Desktop Transfer Management
+## 2. Sliding-Window Flow Control
 
-### Storage Location
-- Received files are saved by default to the user's standard Downloads directory (`~/Downloads/Tools/` on Linux).
-- Temporary chunks are accumulated in a `.part` staging file until transfer completion is verified.
+To saturate available network bandwidth without overflowing serial Bluetooth buffers:
+- **Bluetooth RFCOMM**: Window size $W = 8$ unacknowledged chunks (chunk size: 4 KB to 8 KB).
+- **WebSocket (LAN)**: Window size $W = 32$ unacknowledged chunks (chunk size: 64 KB to 128 KB).
+- The receiver replenishes window credits via `DataType::ChunkAck` (`0x09`) whenever in-flight credits fall to $\le W/2$.
 
-### Transport Chunking Strategy
-- **WebSocket**: Large chunk sizes (e.g. 64KB - 256KB) utilize high-throughput local network bandwidth.
-- **Bluetooth RFCOMM**: Calibrated smaller chunk sizes (e.g. 4KB - 8KB) prevent buffer bloat and packet drops over serial RFCOMM connections.
-- **Integrity**: Future iterations include SHA-256 integrity verification upon receiving the final chunk.
+---
+
+## 3. Staging & Atomic File Promotion
+
+- **Staging Location**: Incoming chunks are appended to a temporary file on the same filesystem:
+  `~/Downloads/.tools_staging_{transfer_id}.part`.
+- **Integrity Verification**: IEEE CRC-32 checksums are verified per chunk and across the total file on EOF (`CHUNK_FLAG_EOF`).
+- **Atomic Promotion**: Upon successful EOF verification, the daemon atomically renames `.part` to `~/Downloads/{file_name}`. Failed or cancelled transfers remove the staging file immediately.
